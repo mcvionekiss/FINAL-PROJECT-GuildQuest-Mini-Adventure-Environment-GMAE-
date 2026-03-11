@@ -5,6 +5,17 @@ import guildquest.app.menu.CreateCampaignAction;
 import guildquest.app.menu.ManageCampaignAction;
 import guildquest.app.factory.GameObjectFactory;
 
+import guildquest.gmae.adventures.test.TestAdventure;
+import guildquest.gmae.adventures.itemgrab.ItemGrabDuel;
+import guildquest.gmae.adventures.wordbomb.WordBombDuel;
+import guildquest.gmae.engine.AdventureState;
+import guildquest.gmae.engine.MiniAdventure;
+import guildquest.gmae.engine.MiniAdventureEngine;
+import guildquest.gmae.enums.InputType;
+import guildquest.gmae.enums.PlayerSlot;
+import guildquest.gmae.profile.PlayerProfile;
+import guildquest.gmae.integration.GuildQuestProfileLoader;
+
 import java.util.HashMap;
 import java.util.Map;
 
@@ -18,11 +29,16 @@ import java.util.*;
 public class GuildQuestApp {
     private final Scanner in = new Scanner(System.in);
     private final GuildQuest system = new GuildQuest();
+    private final MiniAdventureEngine miniAdventureEngine;
+    private final GuildQuestProfileLoader profileLoader;
     private User currentUser;
     private Map<String, MenuAction> campaignActions;
 
     public GuildQuestApp() {
+        this.miniAdventureEngine = new MiniAdventureEngine();
+        this.profileLoader = new GuildQuestProfileLoader(system);
         initCampaignActions();
+        registerMiniAdventures();
     }
 
     public void start() {
@@ -103,6 +119,7 @@ public class GuildQuestApp {
             System.out.println("3) Campaigns");
             System.out.println("4) Characters/Inventory");
             System.out.println("5) Sharing");
+            System.out.println("6) Mini-Adventures");
             System.out.println("0) Logout");
             System.out.print("> ");
             String c = in.nextLine().trim();
@@ -112,6 +129,7 @@ public class GuildQuestApp {
                 case "3" -> campaignsMenu();
                 case "4" -> charactersMenu();
                 case "5" -> sharingMenu();
+                case "6" -> adventureMenuLoop();
                 case "0" -> { currentUser = null; return; }
                 default -> System.out.println("Invalid.");
             }
@@ -578,6 +596,146 @@ public class GuildQuestApp {
         }
     }
 
+    // -------- mini-adventure --------
+
+    private void adventureMenuLoop() {
+        while (true) {
+            System.out.println("\n[Mini-Adventures]");
+
+            List<MiniAdventure> adventures = miniAdventureEngine.getRegisteredAdventures();
+            if (adventures.isEmpty()) {
+                System.out.println("No mini-adventures registered.");
+                return;
+            }
+
+            for (int i = 0; i < adventures.size(); i++) {
+                MiniAdventure adventure = adventures.get(i);
+                System.out.println((i + 1) + ") " + adventure.getAdventureName()
+                        + " - " + adventure.getDescription());
+            }
+
+            System.out.println("0) Back");
+            System.out.print("> ");
+            String choice = in.nextLine().trim();
+
+            if (choice.equals("0")) {
+                return;
+            }
+
+            try {
+                int index = Integer.parseInt(choice) - 1;
+                launchSelectedAdventure(index);
+            } catch (NumberFormatException e) {
+                System.out.println("Invalid number.");
+            } catch (Exception e) {
+                System.out.println("Error launching adventure: " + e.getMessage());
+            }
+        }
+    }
+
+    private void launchSelectedAdventure(int index) {
+        miniAdventureEngine.selectAdventure(index);
+
+        Realm realm = getCurrentUserRealmOrFallback();
+        WorldClock clock = system.getWorldClock();
+
+        PlayerProfile player1 = buildPlayerOneProfile();
+        PlayerProfile player2 = buildPlayerTwoProfile();
+
+        miniAdventureEngine.setPlayers(player1, player2);
+        miniAdventureEngine.initializeSelectedAdventure(realm, clock);
+
+        adventureGameLoop();
+    }
+
+    private PlayerProfile buildPlayerOneProfile() {
+        return profileLoader.loadProfileForUser(currentUser);
+    }
+
+    private PlayerProfile buildPlayerTwoProfile() {
+        Realm realm = getCurrentUserRealmOrFallback();
+        return profileLoader.loadGuestProfile("Local Player 2", realm);
+    }
+
+    private Realm getCurrentUserRealmOrFallback() {
+        UUID realmId = currentUser.getSettings().getCurrentRealmId();
+
+        if (realmId != null) {
+            Realm realm = system.getRealm(realmId);
+            if (realm != null) {
+                return realm;
+            }
+        }
+
+        return system.getRealms().stream().findFirst().orElse(null);
+    }
+
+    private void adventureGameLoop() {
+        PlayerSlot currentSlot = PlayerSlot.P1;
+
+        while (!miniAdventureEngine.isAdventureFinished()) {
+            AdventureState state = miniAdventureEngine.getCurrentState();
+
+            System.out.println("\n=== Adventure State ===");
+            System.out.println("Status: " + state.getStatus());
+            System.out.println("Turn: " + state.getTurnNumber());
+            System.out.println("P1 Score: " + state.getPlayer1Score());
+            System.out.println("P2 Score: " + state.getPlayer2Score());
+            System.out.println("Message: " + state.getMessage());
+
+            if (state.getBoardSnapshot() != null && !state.getBoardSnapshot().isBlank()) {
+                System.out.println("Board: " + state.getBoardSnapshot());
+            }
+
+            System.out.print(currentSlot + " input: ");
+            String payload = in.nextLine().trim();
+
+            boolean accepted = miniAdventureEngine.submitInput(currentSlot, InputType.TEXT, payload);
+            if (!accepted) {
+                System.out.println("Invalid input.");
+                continue;
+            }
+
+            miniAdventureEngine.advanceAdventure();
+
+            currentSlot = (currentSlot == PlayerSlot.P1) ? PlayerSlot.P2 : PlayerSlot.P1;
+        }
+
+        AdventureState finalState = miniAdventureEngine.getCurrentState();
+
+        System.out.println("\n=== Adventure Finished ===");
+        System.out.println("Result: " + finalState.getResult());
+        System.out.println("P1 Final Score: " + finalState.getPlayer1Score());
+        System.out.println("P2 Final Score: " + finalState.getPlayer2Score());
+        System.out.println("Message: " + finalState.getMessage());
+
+        updateProfilesAfterAdventure(finalState);
+    }
+
+    private void updateProfilesAfterAdventure(AdventureState finalState) {
+        if (miniAdventureEngine.getPlayer1() == null || miniAdventureEngine.getPlayer2() == null) {
+            return;
+        }
+
+        switch (finalState.getResult()) {
+            case PLAYER1_WIN -> {
+                miniAdventureEngine.getPlayer1().recordWin();
+                miniAdventureEngine.getPlayer2().recordLoss();
+            }
+            case PLAYER2_WIN -> {
+                miniAdventureEngine.getPlayer1().recordLoss();
+                miniAdventureEngine.getPlayer2().recordWin();
+            }
+            case DRAW -> {
+                miniAdventureEngine.getPlayer1().recordDraw();
+                miniAdventureEngine.getPlayer2().recordDraw();
+            }
+            case ONGOING -> {
+                // do nothing
+            }
+        }
+    }
+
     // -------- Helpers --------
     private WorldTime promptWorldTime(String label) {
         System.out.println(label + " time:");
@@ -616,5 +774,11 @@ public class GuildQuestApp {
 
         campaignActions.put("1", new CreateCampaignAction());
         campaignActions.put("2", new ManageCampaignAction());
+    }
+
+    private void registerMiniAdventures() {
+        miniAdventureEngine.registerAdventure(new TestAdventure());
+        miniAdventureEngine.registerAdventure(new ItemGrabDuel());
+        miniAdventureEngine.registerAdventure(new WordBombDuel());
     }
 }
